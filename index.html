@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Simple Video Proctor (Fixed)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; margin: 12px; }
+    #videoWrap { display:flex; gap:16px; align-items:flex-start; }
+    video, canvas { border: 1px solid #ddd; border-radius:6px; background:#fff; }
+    #controls { margin-top:10px; }
+    #log { height:220px; overflow:auto; background:#f8f8f8; padding:8px; border-radius:6px; }
+    .badge { display:inline-block; padding:4px 8px; background:#eee; border-radius:12px; margin-right:8px; }
+  </style>
+</head>
+<body>
+  <h2>Simple Video Proctor (Fixed)</h2>
+  <div id="status">
+    <span class="badge" id="faceCount">Faces: 0</span>
+    <span class="badge" id="lookStatus">Looking: —</span>
+    <span class="badge" id="itemStatus">Items: —</span>
+    <span class="badge" id="recordingStatus">Recording: No</span>
+  </div>
+
+  <div id="videoWrap">
+    <div>
+      <video id="video" autoplay muted playsinline style="width:480px;height:360px"></video>
+      <div id="controls">
+        <button id="startBtn">Start</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <button id="downloadVideoBtn" disabled>Download Video</button>
+        <button id="downloadLogBtn" disabled>Download Log</button>
+        <button id="sendBackendBtn">Send logs to backend (optional)</button>
+      </div>
+    </div>
+    <div>
+      <canvas id="overlay" width="480" height="360"></canvas>
+      <h4>Events</h4>
+      <div id="log"></div>
+    </div>
+  </div>
+
+  <h3>Generated Report</h3>
+  <pre id="report">No report yet</pre>
+
+  <!-- TFJS + models -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+
+  <script>
+  // ---------- Config ----------
+  const CONFIG = {
+    lookAwayThresholdSec: 5,
+    noFaceThresholdSec: 10,
+    detectionIntervalMs: 250,
+    lookCenterTolerance: 0.28
+  };
+
+  // ---------- UI ----------
+  const video = document.getElementById('video');
+  const overlay = document.getElementById('overlay');
+  const ctx = overlay.getContext('2d');
+  const logEl = document.getElementById('log');
+  const faceCountBadge = document.getElementById('faceCount');
+  const lookStatusBadge = document.getElementById('lookStatus');
+  const itemStatusBadge = document.getElementById('itemStatus');
+  const recordingStatusBadge = document.getElementById('recordingStatus');
+  const reportEl = document.getElementById('report');
+
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const downloadVideoBtn = document.getElementById('downloadVideoBtn');
+  const downloadLogBtn = document.getElementById('downloadLogBtn');
+  const sendBackendBtn = document.getElementById('sendBackendBtn');
+
+  // ---------- State ----------
+  let mediaStream = null;
+  let mediaRecorder = null;
+  let recordedBlobs = [];
+  let faceModel = null;   // blazeface
+  let detectorModel = null; // coco-ssd
+  let running = false;
+  let lastFaceSeenAt = Date.now();
+  let lastLookAtScreenAt = Date.now();
+  let detectionTimer = null;
+  const events = [];
+  let startedAt = null;
+
+  // ---------- Helpers ----------
+  function ts(){ return new Date().toISOString(); }
+  function logEvent(type, message){
+    const e = { ts: ts(), type, message };
+    events.push(e);
+    const d = document.createElement('div');
+    d.textContent = `[${e.ts}] ${type} — ${message}`;
+    logEl.prepend(d);
+    console.log(e.type, e.message);
+  }
+
+  // ---------- Load models ----------
+  async function loadModels() {
+    try {
+      console.log('Loading BlazeFace...');
+      faceModel = await blazeface.load();
+      console.log('Loading coco-ssd...');
+      detectorModel = await cocoSsd.load();
+      logEvent('INFO', 'Models loaded');
+    } catch (err) {
+      console.error('Model load error:', err);
+      logEvent('ERROR', 'Failed to load models. See console.');
+      throw err;
+    }
+  }
+
+  // ---------- Start/Stop ----------
+  async function startProctoring(){
+    try {
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      if (!faceModel || !detectorModel) {
+        await loadModels();
+      }
+
+      mediaStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: true });
+      video.srcObject = mediaStream;
+      await video.play();
+
+      // set overlay to video real size
+      overlay.width = video.videoWidth || 480;
+      overlay.height = video.videoHeight || 360;
+
+      // start recorder
+      recordedBlobs = [];
+      try {
+        mediaRecorder = new MediaRecorder(mediaStream);
+        mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recordedBlobs.push(e.data); };
+        mediaRecorder.start(1000);
+        recordingStatusBadge.textContent = 'Recording: Yes';
+      } catch (err) {
+        console.warn('MediaRecorder not supported', err);
+        logEvent('WARN', 'MediaRecorder not supported in this browser');
+      }
+
+      startedAt = new Date();
+      running = true;
+      lastFaceSeenAt = Date.now();
+      lastLookAtScreenAt = Date.now();
+
+      detectionTimer = setInterval(runDetections, CONFIG.detectionIntervalMs);
+      logEvent('INFO', 'Proctoring started');
+    } catch (err) {
+      console.error('start error', err);
+      logEvent('ERROR', 'Cannot start proctoring: ' + (err.message||err));
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+  }
+
+  function stopProctoring(){
+    if (!running) return;
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    clearInterval(detectionTimer);
+    detectionTimer = null;
+    if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    recordingStatusBadge.textContent = 'Recording: No';
+    logEvent('INFO', 'Proctoring stopped');
+    downloadVideoBtn.disabled = recordedBlobs.length === 0;
+    downloadLogBtn.disabled = events.length === 0;
+    generateReport();
+  }
+
+  downloadVideoBtn.onclick = () => {
+    const blob = new Blob(recordedBlobs, { type: 'video/webm' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `proctor_${new Date().toISOString()}.webm`;
+    a.click();
+  };
+  downloadLogBtn.onclick = () => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([JSON.stringify(events,null,2)], {type:'application/json'}));
+    a.download = `events_${new Date().toISOString()}.json`;
+    a.click();
+  };
+
+  sendBackendBtn.onclick = async () => {
+    try {
+      const payload = { candidate: "Unknown", startedAt, events };
+      const r = await fetch('/api/logs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      if (r.ok) logEvent('INFO','Sent logs to backend');
+      else { logEvent('WARN','Failed to send logs to backend (no server?)'); console.warn(await r.text()); }
+    } catch (err) {
+      console.warn(err);
+      logEvent('WARN','Failed to send logs to backend (no server?)');
+    }
+  };
+
+  // ---------- Detections ----------
+  async function runDetections(){
+    if (!running) return;
+    try {
+      ctx.clearRect(0,0,overlay.width,overlay.height);
+      ctx.drawImage(video, 0, 0, overlay.width, overlay.height);
+
+      // Face detection with BlazeFace
+      let faces = [];
+      try {
+        faces = await faceModel.estimateFaces(video, false);
+      } catch (err) {
+        console.warn('face detect err', err);
+      }
+      const faceCount = faces.length;
+      faceCountBadge.textContent = `Faces: ${faceCount}`;
+
+      // draw faces
+      faces.forEach(f => {
+        let [x1,y1] = f.topLeft;
+        let [x2,y2] = f.bottomRight;
+        // scale to overlay (blazeface returns pixel coords for video)
+        const sx = overlay.width / (video.videoWidth || overlay.width);
+        const sy = overlay.height / (video.videoHeight || overlay.height);
+        ctx.strokeStyle = '#00ff66'; ctx.lineWidth = 2;
+        ctx.strokeRect(x1*sx, y1*sy, (x2-x1)*sx, (y2-y1)*sy);
+      });
+
+      // multiple faces
+      if (faceCount > 1) {
+        logEvent('SUSPICIOUS', `Multiple faces detected: ${faceCount}`);
+        lastFaceSeenAt = Date.now();
+      }
+
+      if (faceCount >= 1) {
+        lastFaceSeenAt = Date.now();
+      } else {
+        const noFaceSec = (Date.now() - lastFaceSeenAt) / 1000;
+        if (noFaceSec > CONFIG.noFaceThresholdSec) {
+          logEvent('ABSENCE', `No face for ${Math.round(noFaceSec)}s`);
+          lookStatusBadge.textContent = 'Looking: No face';
+          lookStatusBadge.style.background = '#ffd6d6';
+        } else {
+          lookStatusBadge.textContent = 'Looking: maybe';
+          lookStatusBadge.style.background = '';
+        }
+      }
+
+      // Focus heuristic: use largest face center
+      if (faceCount >= 1) {
+        const largest = faces.reduce((a,b) => {
+          const aw = (a.bottomRight[0]-a.topLeft[0])*(a.bottomRight[1]-a.topLeft[1]);
+          const bw = (b.bottomRight[0]-b.topLeft[0])*(b.bottomRight[1]-b.topLeft[1]);
+          return (aw > bw) ? a : b;
+        });
+        const [x1,y1] = largest.topLeft;
+        const [x2,y2] = largest.bottomRight;
+        const centerX = (x1 + x2)/2 / (video.videoWidth || overlay.width);
+        const centerY = (y1 + y2)/2 / (video.videoHeight || overlay.height);
+        const dx = centerX - 0.5;
+        const dy = centerY - 0.5;
+        const devi = Math.max(Math.abs(dx), Math.abs(dy));
+        // draw center point
+        ctx.fillStyle = 'rgba(0,0,255,0.7)'; ctx.beginPath();
+        ctx.arc(centerX*overlay.width, centerY*overlay.height, 4,0,Math.PI*2); ctx.fill();
+
+        if (devi > CONFIG.lookCenterTolerance) {
+          const since = (Date.now() - lastLookAtScreenAt) / 1000;
+          if (since > CONFIG.lookAwayThresholdSec) {
+            logEvent('FOCUS_LOST', `Looking away for ${Math.round(since)}s`);
+          }
+          lookStatusBadge.textContent = `Looking: AWAY`;
+          lookStatusBadge.style.background = '#ffd6d6';
+        } else {
+          lookStatusBadge.textContent = `Looking: YES`;
+          lookStatusBadge.style.background = '#e6ffea';
+          lastLookAtScreenAt = Date.now();
+        }
+      }
+
+      // Object detection (coco-ssd)
+      let predictions = [];
+      try {
+        predictions = await detectorModel.detect(video);
+      } catch (err) {
+        console.warn('object detect error', err);
+      }
+      const interesting = predictions.filter(p => ['cell phone','book','laptop','keyboard','mouse','remote'].includes(p.class));
+      if (interesting.length > 0) {
+        interesting.forEach(o=>{
+          const [x,y,w,h] = o.bbox;
+          const scaleX = overlay.width / (video.videoWidth || overlay.width);
+          const scaleY = overlay.height / (video.videoHeight || overlay.height);
+          ctx.strokeStyle = '#ff9900'; ctx.lineWidth = 2;
+          ctx.strokeRect(x*scaleX, y*scaleY, w*scaleX, h*scaleY);
+          ctx.fillStyle = '#ff9900'; ctx.font='14px Arial';
+          ctx.fillText(o.class + ' ' + Math.round(o.score*100) + '%', x*scaleX + 4, y*scaleY + 14);
+        });
+        itemStatusBadge.textContent = `Items: ${interesting.map(i=>i.class).join(',')}`;
+        itemStatusBadge.style.background = '#fff3e0';
+        logEvent('ITEM_DETECTED', `Detected: ${interesting.map(i=>i.class).join(',')}`);
+      } else {
+        itemStatusBadge.textContent = 'Items: none';
+        itemStatusBadge.style.background = '';
+      }
+
+    } catch (err) {
+      console.error('detection loop error', err);
+      logEvent('ERROR', 'Detection error; see console');
+      // stop loop to avoid spam — you can remove this in dev
+      // clearInterval(detectionTimer);
+    }
+  }
+
+  // ---------- Report ----------
+  function generateReport(){
+    const durationSec = startedAt ? Math.round((new Date() - startedAt)/1000) : 0;
+    const focusLostEvents = events.filter(e => e.type === 'FOCUS_LOST').length;
+    const absenceEvents = events.filter(e => e.type === 'ABSENCE').length;
+    const multipleFaceEvents = events.filter(e => e.type === 'SUSPICIOUS' && e.message.includes('Multiple faces')).length;
+    const itemEvents = events.filter(e => e.type === 'ITEM_DETECTED').length;
+    let score = 100 - focusLostEvents*5 - absenceEvents*8 - multipleFaceEvents*10 - itemEvents*7;
+    if (score < 0) score = 0;
+    const report = { candidate: "Unknown", startedAt, durationSec, focusLostEvents, absenceEvents, multipleFaceEvents, itemEvents, integrityScore: score, events };
+    reportEl.textContent = JSON.stringify(report, null, 2);
+  }
+
+  // ---------- Init ----------
+  (async () => {
+    try {
+      // just pre-load models so the UI stays responsive later
+      await loadModels();
+    } catch(e){
+      console.warn('models failed to load at init; they will be retried on Start');
+    }
+    startBtn.onclick = startProctoring;
+    stopBtn.onclick = stopProctoring;
+  })();
+
+  </script>
+</body>
+</html>
